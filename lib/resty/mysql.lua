@@ -1880,11 +1880,10 @@ end
 --- 执行一个预处理语句
 ---@param self Connection 链接实例
 ---@param stmt table `prepare`函数返回的statement句柄
----@param ... unknown 绑定的参数
+---@param args string[] 绑定的参数
 ---@return table? 结果
 ---@return string? 错误信息
-function _M.execute(self, stmt, ...)
-    local args = { ... }
+function _M.execute(self, stmt, args)
     local n_params = #args
 
     if n_params ~= stmt.parameters then

@@ -22,6 +22,8 @@ Table of Contents
     * [query](#query)
     * [server_ver](#server_ver)
     * [set_compact_arrays](#set_compact_arrays)
+    * [prepare](#prepare)
+    * [execute](#execute)
 * [SQL Literal Quoting](#sql-literal-quoting)
 * [Multi-Resultset Support](#multi-resultset-support)
 * [Debugging](#debugging)
@@ -274,6 +276,8 @@ In case of success, returns `1`. In case of errors, returns `nil` with a string 
 
 Only call this method in the place you would have called the `close` method instead. Calling this method will immediately turn the current `resty.mysql` object into the `closed` state. Any subsequent operations other than `connect()` on the current objet will return the `closed` error.
 
+If the connection is the first appear or did a statement, it may do a LRU with statements.
+
 [Back to TOC](#table-of-contents)
 
 get_reused_times
@@ -379,6 +383,30 @@ Sets whether to use the "compact-arrays" structure for the resultsets returned b
 This method was first introduced in the `v0.09` release.
 
 [Back to TOC](#table-of-contents)
+
+prepare
+----------
+`syntax: stmt, err, errcode, sqlstate = db:prepare(query)`
+
+Returns the table of stmt.
+
+You should only call this method after successfully connecting to a MySQL server. it will check cached statements of the connction or creat a new stmt and cache it.
+
+the cache in moudel level(the worker level if I understand correctly.)
+
+[Back to TOC](#table-of-contents)
+
+execute
+----------
+`syntax: res, err, errcode, sqlstate = db:execute(stmt, args)`
+
+Full the statements with args, return the result of query.
+
+You should only call this method after successfully connecting to a MySQL server.
+
+[Back to TOC](#table-of-contents)
+
+
 
 SQL Literal Quoting
 ===================

@@ -26,6 +26,7 @@ local to_int = math.floor
 
 local has_rsa, resty_rsa = pcall(require, "resty.rsa")
 
+local statement_cache = {} -- statement缓存
 
 if not ngx.config then
     error("ngx_lua 0.9.11+ or ngx_stream_lua required")
@@ -697,6 +698,7 @@ local function _read_hand_shake_packet(self)
     self._server_ver = server_ver
 
     local thread_id, pos = _get_byte4(packet, pos)
+    self.thread_id = thread_id -- 用于记录statement所属连接
 
     local scramble = sub(packet, pos, pos + 8 - 1)
     if not scramble then
@@ -1220,6 +1222,29 @@ function _M.connect(self, opts)
 end
 
 
+---LRU淘汰连接缓存
+---@param pool_cache table 缓存
+---@param limit integer 限制大小
+---@param count integer? 当前大小
+local function _evict_lru_thread_id(pool_cache, limit, count)
+    local sort_cache = new_tab(count or (limit * 2))
+    local i = 1
+    for k, v in pairs(pool_cache) do
+        sort_cache[i] = { k, v.last_used }
+    end
+    table.sort(sort_cache, function(a, b)
+        if a and b and a[2] > b[2] then
+            return true
+        else
+            return false
+        end
+    end)
+    for i = limit, #sort_cache do
+        pool_cache[sort_cache[i][1]] = nil
+    end
+end
+
+
 function _M.set_keepalive(self, ...)
     local sock = self.sock
     if not sock then
@@ -1230,6 +1255,13 @@ function _M.set_keepalive(self, ...)
         return nil, "cannot be reused in the current connection state: "
                     .. (self.state or "nil")
     end
+
+    -- 检查并执行LRU淘汰
+    local pool_cache = statement_cache[self.pool]
+    if self.thread_id and pool_cache and table.nkeys(pool_cache) > self.sockArg.pool_size * 2 then
+        _evict_lru_thread_id(pool_cache, self.sockArg.pool_size)
+    end
+
 
     self.state = nil
     return sock:setkeepalive(...)
@@ -1423,5 +1455,590 @@ function _M.set_compact_arrays(self, value)
     self.compact = value
 end
 
+
+---[[
+---这里是prepare和statement(新增),部分代码来自https://github.com/iresty/lua-resty-mysql/tree/feature/prepare_statement
+---由Gemini修改,本人进行纠正.
+---]]
+
+-- MySQL 命令常量
+local COM_STMT_PREPARE = 0x16
+local COM_STMT_EXECUTE = 0x17
+local COM_STMT_CLOSE = 0x19
+
+-- MySQL 类型常量，用于参数绑定
+-- 参考: https://dev.mysql.com/doc/internals/en/binary-protocol-value.html
+local MYSQL_TYPE_DECIMAL = 0
+local MYSQL_TYPE_TINY = 1
+local MYSQL_TYPE_SHORT = 2
+local MYSQL_TYPE_LONG = 3
+local MYSQL_TYPE_FLOAT = 4
+local MYSQL_TYPE_DOUBLE = 5
+local MYSQL_TYPE_NULL = 6
+local MYSQL_TYPE_TIMESTAMP = 7
+local MYSQL_TYPE_LONGLONG = 8
+local MYSQL_TYPE_INT24 = 9
+local MYSQL_TYPE_DATE = 10
+local MYSQL_TYPE_TIME = 11
+local MYSQL_TYPE_DATETIME = 12
+local MYSQL_TYPE_YEAR = 13
+local MYSQL_TYPE_NEWDATE = 14
+local MYSQL_TYPE_VARCHAR = 15
+local MYSQL_TYPE_BIT = 16
+local MYSQL_TYPE_TIMESTAMP2 = 17
+local MYSQL_TYPE_DATETIME2 = 18
+local MYSQL_TYPE_TIME2 = 19
+local MYSQL_TYPE_JSON = 245
+local MYSQL_TYPE_NEWDECIMAL = 246
+local MYSQL_TYPE_ENUM = 247
+local MYSQL_TYPE_SET = 248
+local MYSQL_TYPE_TINY_BLOB = 249
+local MYSQL_TYPE_MEDIUM_BLOB = 250
+local MYSQL_TYPE_LONG_BLOB = 251
+local MYSQL_TYPE_BLOB = 252
+local MYSQL_TYPE_VAR_STRING = 253
+local MYSQL_TYPE_STRING = 254
+
+-- FFI 用于高效处理浮点数到字节的转换
+local ffi = require("ffi")
+ffi.cdef [[
+    typedef union { float value; char bytes[4]; } float_u;
+    typedef union { double value; char bytes[8]; } double_u;
+]]
+local c_float_u = ffi.new("float_u")
+local c_double_u = ffi.new("double_u")
+
+
+--- 发送一个带命令头的通用数据包
+---@param self Connection 链接实例
+---@param data string|table 要发送的数据
+---@param cmd_type integer 命令类型 (例如 COM_STMT_PREPARE)
+---@return integer? 发送的字节数
+---@return string? 错误信息
+---@return integer? 错误代码
+---@return string? 标准错误码
+local function _send_com_packet(self, data, cmd_type)
+    if self.state ~= STATE_CONNECTED then
+        return nil, "cannot send command in the current context: " .. (self.state or "nil")
+    end
+
+    local sock = self.sock
+    if not sock then
+        return nil, "not initialized"
+    end
+
+    self.packet_no = -1
+    local packet_len
+    local cmd_packet
+    if type(data) == "table" then
+        cmd_packet = { strchar(cmd_type) }
+        packet_len = 1
+        for i = 1, #data do
+            local part = data[i]
+            packet_len = packet_len + #part
+            cmd_packet[#cmd_packet + 1] = part
+        end
+    else
+        cmd_packet = strchar(cmd_type) .. data
+        packet_len = 1 + #data
+    end
+
+    local bytes, err = _send_packet(self, cmd_packet, packet_len)
+    if not bytes then
+        return nil, err
+    end
+
+    self.state = STATE_COMMAND_SENT
+    return bytes
+end
+
+
+--- 读取并解析 COM_STMT_PREPARE 的响应
+---@param self Connection 链接实例
+---@return table? statement 描述表
+---@return string? 错误信息
+---@return integer? 错误码
+---@return string? SQLSTATE
+local function _read_prepare_response(self)
+    if self.state ~= STATE_COMMAND_SENT then
+        return nil, "cannot read result in the current context: " .. (self.state or "nil")
+    end
+
+    -- 1. 读取 PREPARE OK Packet
+    local packet, typ, err = _recv_packet(self)
+    if not packet then
+        self.state = STATE_CONNECTED
+        return nil, err
+    end
+
+    if typ == RESP_ERR then
+        self.state = STATE_CONNECTED
+        local errno, msg, sqlstate = _parse_err_packet(packet)
+        return nil, msg, errno, sqlstate
+    end
+
+    if strbyte(packet, 1) ~= 0x00 then
+        self.state = STATE_CONNECTED
+        return nil, "bad prepare response packet type: " .. typ
+    end
+
+    local stmt = new_tab(0, 5)
+    local pos
+    -- 跳过包头 (1 byte 0x00)
+    stmt.statement_id, pos = _get_byte4(packet, 2)
+    stmt.columns, pos = _get_byte2(packet, pos)
+    stmt.parameters, pos = _get_byte2(packet, pos)
+    -- 跳过 filler (1 byte)
+    pos = pos + 1
+    stmt.warnings, pos = _get_byte2(packet, pos)
+
+    -- 2. 如果有参数，读取参数定义，直到 EOF
+    if stmt.parameters > 0 then
+        for _ = 1, stmt.parameters do
+            packet, typ, err = _recv_packet(self)
+            if not packet then
+                self.state = STATE_CONNECTED
+                return nil, "failed to read parameter definition: " .. err
+            end
+        end
+        -- 读取 EOF
+        packet, typ, err = _recv_packet(self)
+        if not packet or typ ~= RESP_EOF then
+            self.state = STATE_CONNECTED
+            return nil, "expected EOF packet after parameters, but got " .. (typ or "nil")
+        end
+    end
+
+    -- 3. 如果有结果列，读取列定义，直到 EOF
+    if stmt.columns > 0 then
+        local cols = new_tab(stmt.columns, 0)
+        for i = 1, stmt.columns do
+            local col, err, errno, sqlstate = _recv_field_packet(self)
+            if not col then
+                self.state = STATE_CONNECTED
+                return nil, err, errno, sqlstate
+            end
+            cols[i] = col
+        end
+        stmt.cols = cols
+        -- 读取 EOF
+        packet, typ, err = _recv_packet(self)
+        if not packet or typ ~= RESP_EOF then
+            self.state = STATE_CONNECTED
+            return nil, "expected EOF packet after columns, but got " .. (typ or "nil")
+        end
+    end
+
+    self.state = STATE_CONNECTED
+    return stmt
+end
+
+--- 将长度编码为二进到字符串 (内部函数)
+---@param s string
+---@return string
+local function _to_binary_coded_string(s)
+    local len = #s
+    if len < 251 then
+        return strchar(len) .. s
+    end
+    if len < 65536 then -- 2^16
+        return strchar(252) .. _set_byte2(len) .. s
+    end
+    if len < 16777216 then -- 2^24
+        return strchar(253) .. _set_byte3(len) .. s
+    end
+    -- 对于更大的值，需要8字节镶度，这里暂不完整支持
+    return strchar(254) .. _set_byte4(len) .. _set_byte4(0) .. s
+end
+
+--- 将Lua类型的值编码为MySQL二进制协议格式
+---@param value any 要编码的值
+---@return string 二进制字符串
+---@return integer MySQL类型代码
+local function _encode_value(value)
+    local t = type(value)
+    if value == null or t == "nil" then
+        return "", MYSQL_TYPE_NULL
+    elseif t == "number" then
+        if math.floor(value) == value then
+            return _set_byte4(value), MYSQL_TYPE_LONG
+        else
+            c_double_u.value = value
+            return ffi.string(c_double_u.bytes, 8), MYSQL_TYPE_DOUBLE
+        end
+    elseif t == "string" then
+        return _to_binary_coded_string(value), MYSQL_TYPE_STRING
+    else -- boolean, table, etc.
+        return _to_binary_coded_string(tostring(value)), MYSQL_TYPE_STRING
+    end
+end
+
+--- 解析二进制协议的结果行
+---@param data string 行数据包
+---@param cols table 列定义信息
+---@param compact boolean 是否返回紧凑数组
+---@return table? 解析后的行数据
+---@return string? 错误信息
+local function _parse_binary_row_data_packet(data, cols, compact) -- 标准query返回文本结果,但是statement似乎是二进制结果,所以不可复用.
+    -- 跳过包头 (1 byte 0x00)
+    local pos = 2
+
+    -- 解析 NULL-bitmap
+    local num_cols = #cols
+    -- 根据MySQL二进制协议，NULL-bitmap的长度计算应包含2-bit的偏移量
+    local null_bitmap_len = to_int((num_cols + 7 + 2) / 8)
+    if pos + null_bitmap_len > #data + 1 then
+        return nil, "invalid null-bitmap length"
+    end
+    local null_bitmap = sub(data, pos, pos + null_bitmap_len - 1)
+    pos = pos + null_bitmap_len
+
+    local row
+    if compact then
+        row = new_tab(num_cols, 0)
+    else
+        row = new_tab(0, num_cols)
+    end
+
+    for i = 1, num_cols do
+        local value
+        -- 检查NULL-bitmap中对应的位，需要考虑-1bit + 2-bit的偏移
+        local bit_offset = i + 1 -- i - 1 + 2
+        local byte_idx = to_int(bit_offset / 8) + 1
+        local bit_idx = bit_offset % 8
+        if band(rshift(strbyte(null_bitmap, byte_idx), bit_idx), 1) == 1 then
+            value = null
+        else
+            -- 根据列类型解析二进制数据
+            local col_type = cols[i].type
+
+            if col_type == MYSQL_TYPE_STRING or col_type == MYSQL_TYPE_VARCHAR or
+                col_type == MYSQL_TYPE_VAR_STRING or col_type == MYSQL_TYPE_ENUM or
+                col_type == MYSQL_TYPE_SET or col_type == MYSQL_TYPE_LONG_BLOB or
+                col_type == MYSQL_TYPE_MEDIUM_BLOB or col_type == MYSQL_TYPE_BLOB or
+                col_type == MYSQL_TYPE_TINY_BLOB or col_type == MYSQL_TYPE_JSON or
+                col_type == MYSQL_TYPE_NEWDECIMAL or col_type == MYSQL_TYPE_BIT then
+                value, pos = _from_length_coded_str(data, pos)
+            elseif col_type == MYSQL_TYPE_LONGLONG then
+                value, pos = _get_byte8(data, pos)
+            elseif col_type == MYSQL_TYPE_LONG or col_type == MYSQL_TYPE_INT24 then
+                value, pos = _get_byte4(data, pos)
+            elseif col_type == MYSQL_TYPE_SHORT or col_type == MYSQL_TYPE_YEAR then
+                value, pos = _get_byte2(data, pos)
+            elseif col_type == MYSQL_TYPE_TINY then
+                value = strbyte(data, pos)
+                pos = pos + 1
+            elseif col_type == MYSQL_TYPE_DOUBLE then
+                c_double_u.value = ffi.cast("double", sub(data, pos, pos + 7))
+                value = c_double_u.value
+                pos = pos + 8
+            elseif col_type == MYSQL_TYPE_FLOAT then
+                c_float_u.value = ffi.cast("float", sub(data, pos, pos + 3))
+                value = c_float_u.value
+                pos = pos + 4
+            else
+                -- 对于未明确处理的日期、时间等类型，作为字符串安全读取
+                value, pos = _from_length_coded_str(data, pos)
+            end
+        end
+
+        if compact then
+            row[i] = value
+        else
+            row[cols[i].name] = value
+        end
+    end
+    return row
+end
+
+--- 读取二进制结果集
+---@param self Connection 链接实例
+---@param stmt table statement句柄
+---@return table? 结果表
+---@return string? 错误信息
+---@return integer? 错误代码
+---@return string? 标准错误码
+local function _read_binary_result(self, stmt)
+    local packet, typ, err = _recv_packet(self)
+    if not packet then
+        return nil, err
+    end
+
+    if typ == RESP_ERR then
+        self.state = STATE_CONNECTED
+        local errno, msg, sqlstate = _parse_err_packet(packet)
+        return nil, msg, errno, sqlstate
+    end
+
+    if typ == RESP_OK then
+        self.state = STATE_CONNECTED
+        return _parse_ok_packet(packet)
+    end
+
+    -- 1. 读取结果头 (列数量)
+    local field_count, _ = _parse_result_set_header_packet(packet)
+
+    -- 2. 列定义在prepare阶段已获取(stmt.cols)，直接跳过
+    for _ = 1, field_count do
+        _recv_packet(self)
+    end
+    _recv_packet(self) -- EOF
+
+    -- 3. 读取行数据
+    local rows = new_tab(4, 0)
+    local i = 0
+    while true do
+        packet, typ, err = _recv_packet(self)
+        if not packet then
+            return nil, err
+        end
+
+        if typ == RESP_EOF then
+            local _, status_flags = _parse_eof_packet(packet)
+            if band(status_flags, SERVER_MORE_RESULTS_EXISTS) ~= 0 then
+                return rows, "again"
+            end
+            break
+        end
+
+        if typ == RESP_ERR then
+            self.state = STATE_CONNECTED
+            local errno, msg, sqlstate = _parse_err_packet(packet)
+            return nil, msg, errno, sqlstate
+        end
+
+        i = i + 1
+        rows[i] = _parse_binary_row_data_packet(packet, stmt.cols, self.compact)
+    end
+
+    self.state = STATE_CONNECTED
+    return rows
+end
+
+--- 预处理SQL语句
+---@param self Connection 链接实例
+---@param sql string 要预处理的SQL语句
+---@return table? statement句柄
+---@return string? 错误信息
+---@return integer? 错误代码
+---@return string? 标准错误码
+function _M.prepare(self, sql)
+    local function do_prepare()
+        -- 1. 发送预编译指令
+        local _, err, errno, sqlstate = _send_com_packet(self, sql, COM_STMT_PREPARE)
+        if not _ then
+            return nil, "failed to send prepare command: " .. err, errno, sqlstate
+        end
+        -- 2. 读取预编译结果
+        return _read_prepare_response(self)
+    end
+
+    local pool_key = self.pool
+    if not pool_key then
+        -- 不属于任何池的连接，直接执行prepare
+        return do_prepare()
+    end
+
+    local thread_id, err, errno, sqlstate = self:get_connection_id()
+    if not thread_id then
+        -- 无法获取连接ID，无法使用缓存，直接执行prepare
+        return do_prepare()
+    end
+
+    -- 查找或创建缓存表
+    local pool_cache = statement_cache[pool_key]
+    if not pool_cache then
+        pool_cache = {}
+        statement_cache[pool_key] = pool_cache
+    end
+    local conn_cache = pool_cache[thread_id]
+    if not conn_cache then
+        conn_cache = { last_used = ngx.now(), stmts = {} }
+        pool_cache[thread_id] = conn_cache
+    end
+
+    -- 检查缓存命中
+    local cached = conn_cache.stmts[sql]
+    if cached then
+        conn_cache.last_used = ngx.now()
+        return cached.stmt
+    end
+
+    -- 缓存未命中，执行原始prepare
+    local stmt, err, errno, sqlstate = do_prepare()
+    if not stmt then
+        return nil, err, errno, sqlstate
+    end
+
+    -- 存入缓存
+    conn_cache.stmts[sql] = { stmt = stmt }
+    conn_cache.last_used = ngx.now()
+
+    return stmt
+end
+
+--- 执行一个预处理语句
+---@param self Connection 链接实例
+---@param stmt table `prepare`函数返回的statement句柄
+---@param ... unknown 绑定的参数
+---@return table? 结果
+---@return string? 错误信息
+function _M.execute(self, stmt, ...)
+    local args = { ... }
+    local n_params = #args
+
+    if n_params ~= stmt.parameters then
+        return nil, "incorrect number of arguments: expected " .. stmt.parameters .. ", got " .. n_params
+    end
+
+    -- 1. 构建包体
+    local packet_parts = new_tab(5, 0)
+    packet_parts[1] = _set_byte4(stmt.statement_id) -- statement-id
+    packet_parts[2] = strchar(0)                    -- flags (0 = CURSOR_TYPE_NO_CURSOR)
+    packet_parts[3] = _set_byte4(1)                 -- iteration-count (always 1)
+
+    if n_params > 0 then
+        -- NULL-bitmap
+        local null_bitmap_len = to_int((n_params + 7) / 8)
+        local null_bitmap = new_tab(null_bitmap_len, 0)
+        for i = 1, null_bitmap_len do null_bitmap[i] = 0 end
+
+        local types = new_tab(n_params * 2, 0)
+        local values = new_tab(n_params, 0)
+
+        for i = 1, n_params do
+            local val_str, val_type = _encode_value(args[i])
+            if val_type == MYSQL_TYPE_NULL then
+                local byte_idx = to_int((i - 1) / 8) + 1
+                local bit_idx = (i - 1) % 8
+                null_bitmap[byte_idx] = bor(null_bitmap[byte_idx], lshift(1, bit_idx))
+            end
+            types[#types + 1] = strchar(val_type, 0) -- type + unused byte
+            values[#values + 1] = val_str
+        end
+
+        local null_bitmap_str = new_tab(#null_bitmap, 0)
+        for i = 1, #null_bitmap do null_bitmap_str[i] = strchar(null_bitmap[i]) end
+        packet_parts[4] = concat(null_bitmap_str)
+
+        packet_parts[5] = strchar(1) -- new-params-bound-flag (1 = true)
+        packet_parts[6] = concat(types)
+        packet_parts[7] = concat(values)
+    end
+
+    -- 2. 发送 COM_STMT_EXECUTE 包
+    local _, err = _send_com_packet(self, packet_parts, COM_STMT_EXECUTE)
+    if err then
+        return nil, err
+    end
+
+    -- 3. 读取结果
+    if stmt.columns > 0 then
+        return _read_binary_result(self, stmt)
+    else
+        -- 对于没有返回结果的(INSERT, UPDATE, DELETE), 读取OK包
+        return read_result(self)
+    end
+end
+
+--- 关闭一个预处理语句
+---@param self Connection 链接实例
+---@param stmt table|number 要关闭的statement句柄或ID
+---@return integer? 关闭的句柄
+---@return string? 错误信息
+---@return integer? 错误代码
+---@return string? 标准错误码
+function _M.close_statement(self, stmt)
+    local stmt_id
+    if type(stmt) == "table" then
+        stmt_id = stmt.statement_id
+    else
+        stmt_id = stmt
+    end
+
+    local packet = _set_byte4(stmt_id)
+    -- close命令没有响应
+    return _send_com_packet(self, packet, COM_STMT_CLOSE)
+end
+
+---获取当前连接在MySQL服务器中的线程ID
+---此方法会发起一次 `SELECT CONNECTION_ID()` 查询来获取实时的线程ID。
+---这对于验证从连接池中取出的连接是否为预期的连接非常有用。
+---@param self Connection 连接实例
+---@return number? 线程ID
+---@return string? 错误信息
+---@return integer? 错误代码
+---@return string? 标准错误码
+function _M.get_connection_id(self)
+    if self.thread_id then
+        return self.thread_id
+    end
+    if self.state ~= STATE_CONNECTED then
+        return nil, "cannot send query in the current context: "
+            .. (self.state or "nil")
+    end
+    local sock = self.sock
+    if not sock then
+        return nil, "not initialized"
+    end
+    -- 警告：直接发送原始包，您需要自行确保包序号同步的正确性
+    local bytes, err = sock:send({ _set_byte3(23), strchar(0), strchar(COM_QUERY), "SELECT CONNECTION_ID()" })
+    if not bytes then
+        return nil, err
+    end
+    self.state = STATE_COMMAND_SENT
+
+    -- 读取结果
+    local data
+    local row_data                  -- 用于存储行数据包
+    for i = 1, 4 do
+        data, err = sock:receive(4) -- 读取包头
+        if not data then
+            self.state = STATE_CONNECTED; return nil, "recv header failed: " .. (err or "closed")
+        end
+        local len, pos = _get_byte3(data, 1)
+        if len > 0 then
+            data, err = sock:receive(len)
+            if not data then
+                self.state = STATE_CONNECTED; return nil, "recv body failed: " .. (err or "closed")
+            end
+        else
+            data = ""
+        end
+        if i == 4 then
+            row_data = data -- 保存第4个包（行数据）
+        end
+    end
+
+    -- 消耗掉最后一个EOF包
+    data, err = sock:receive(4)
+    if data then
+        local len, pos = _get_byte3(data, 1)
+        if len and len > 0 then
+            sock:receive(len)
+        end
+    end
+
+    self.state = STATE_CONNECTED -- 恢复连接状态
+
+    if not row_data then
+        return nil, "did not receive row data packet"
+    end
+
+    -- 从保存的行数据中解析
+    local thread_id_str, _ = _from_length_coded_str(row_data, 1)
+
+    if thread_id_str and thread_id_str ~= null then
+        local thread_id = tonumber(thread_id_str)
+        if thread_id then
+            self.thread_id = thread_id
+            return thread_id
+        end
+    end
+
+    return nil, "failed to parse connection_id from result"
+end
+
+-- statement end.
 
 return _M
